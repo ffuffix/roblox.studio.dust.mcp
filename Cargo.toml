@@ -1,0 +1,31 @@
+[package]
+name = "dust_robloxstudio_mcp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dust_robloxstudio_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dust"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rmcp = { version = "0.9", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
