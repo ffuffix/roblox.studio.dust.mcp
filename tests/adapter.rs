@@ -40,7 +40,6 @@ fn multiple_live_sessions_force_disambiguation() {
         session("b", Some("staging"), LiveState::Live),
     ];
     let err = resolve_session(&sessions, None).unwrap_err();
-    // Must refuse to guess and point at list_sessions, and name candidates.
     assert!(err.contains("list_sessions"), "got: {err}");
     assert!(err.contains("staging"), "got: {err}");
 }
@@ -52,7 +51,6 @@ fn selector_matches_by_id_or_label() {
         session("b", Some("staging"), LiveState::Stale),
     ];
     assert_eq!(resolve_session(&sessions, Some("a")).unwrap(), "a");
-    // A label resolves even when the session is only stale (explicit intent).
     assert_eq!(resolve_session(&sessions, Some("staging")).unwrap(), "b");
 }
 
@@ -87,7 +85,6 @@ async fn client_lists_empty_then_errors_on_unknown_session() {
     let sessions = client.list_sessions().await.unwrap();
     assert!(sessions.is_empty());
 
-    // No such session -> broker 404 -> client surfaces an error.
     let err = client
         .command("ghost", "ping", serde_json::json!({}), Role::Plugin, 500)
         .await

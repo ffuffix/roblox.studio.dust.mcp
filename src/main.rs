@@ -49,8 +49,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Print copy-paste MCP client config and plugin install guidance. Writes to
-/// stdout (this subcommand is run by a human, not over the MCP transport).
 fn print_setup() -> Result<()> {
     let exe = std::env::current_exe()?;
     let exe = exe.display();
@@ -85,7 +83,6 @@ fn print_setup() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    // Logs to stderr so stdout stays clean for the stdio adapter's MCP traffic.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

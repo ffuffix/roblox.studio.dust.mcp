@@ -1,5 +1,5 @@
 //! The broker daemon: the single process that owns the port, the session
-//! registry, and routing (§1). Adapters and plugins are clients of it.
+//! registry, and routing. Adapters and plugins are clients of it.
 
 mod registry;
 mod routes;
@@ -19,25 +19,15 @@ use uuid::Uuid;
 use crate::discovery;
 use crate::protocol::{BrokerInfo, Health, PROTOCOL_VERSION};
 
-/// Loopback port range the broker binds within, in order (§2, §8).
 pub const PORT_RANGE: RangeInclusive<u16> = 1801..=1803;
-/// Shut down after this long with zero adapter activity *and* zero live
-/// sessions (§2). Tunable via [`BrokerConfig`].
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-/// How often the background task checks for idle-shutdown and reaps dead
-/// sessions.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Shared state handed to every request handler.
 pub struct AppState {
     pub registry: Registry,
-    /// Pre-rendered `/health` body. `port` is filled in after binding.
     pub health: Health,
-    /// Secret authenticating adapters (recorded in `broker.json`).
     pub token: String,
-    /// Last time an authenticated adapter request arrived (idle tracking).
     pub last_activity: Mutex<Instant>,
-    /// Notified to trigger graceful shutdown (idle task, `/shutdown`, signal).
     pub shutdown: Notify,
 }
 
@@ -53,7 +43,6 @@ impl AppState {
     }
 }
 
-/// Tunables for a broker run.
 pub struct BrokerConfig {
     pub idle_timeout: Option<Duration>,
 }
@@ -64,21 +53,15 @@ impl Default for BrokerConfig {
     }
 }
 
-/// Generate a 64-hex-char adapter token (two v4 UUIDs, no extra deps).
 fn generate_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// Build the shared state and router for a given bound port. Exposed so tests
-/// can drive the broker on an ephemeral port without touching `broker.json` or
-/// the maintenance task.
 pub fn build_app(token: impl Into<String>, port: u16) -> (axum::Router, Arc<AppState>) {
     let state = Arc::new(AppState::new(token.into(), Uuid::new_v4().to_string(), port));
     (routes::router(state.clone()), state)
 }
 
-/// Bind the first free port in [`PORT_RANGE`] on loopback (§2, §8). All busy is
-/// a hard error with guidance.
 async fn bind_in_range() -> Result<TcpListener> {
     for port in PORT_RANGE {
         match TcpListener::bind(("127.0.0.1", port)).await {
@@ -94,7 +77,6 @@ async fn bind_in_range() -> Result<TcpListener> {
     ))
 }
 
-/// Background loop: reap dead sessions and shut down when idle.
 async fn maintenance(state: Arc<AppState>, idle_timeout: Option<Duration>) {
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
@@ -113,8 +95,6 @@ async fn maintenance(state: Arc<AppState>, idle_timeout: Option<Duration>) {
     }
 }
 
-/// Run the broker to completion: bind, publish `broker.json`, serve until
-/// shutdown (idle, `/shutdown`, or Ctrl-C), then clean up.
 pub async fn run(config: BrokerConfig) -> Result<()> {
     let listener = bind_in_range().await?;
     let port = listener.local_addr()?.port();

@@ -1,10 +1,13 @@
-//! The MCP server exposed over stdio to Claude Desktop / Claude Code. Tools
-//! translate into broker commands routed to a session's plugin (§2, §3).
+//! The MCP server exposed over stdio to Claude Desktop / Claude Code. Each tool
+//! translates into a broker command routed to a session's plugin (or, during a
+//! playtest, its server / client helper) and returns the result.
 //!
-//! Step 2 surfaces the session-management tools plus two round-trip probes
-//! (`get_place_info`, `ping_session`) that exercise the full
-//! adapter → broker → plugin → result loop and the disambiguation rule. Search,
-//! playtest, and the rest land in later steps.
+//! Field-level doc comments on the argument structs are intentional: schemars
+//! turns them into the MCP parameter descriptions the model reads. The
+//! `any_json_schema` / `json_object_schema` helpers give free-form value fields
+//! an explicit JSON type — schemars renders a bare `serde_json::Value` with no
+//! `type`, which Claude Code's validator rejects, and one bad property drops the
+//! entire `tools/list`, so every tool would vanish.
 
 use std::sync::Arc;
 
@@ -21,22 +24,14 @@ use serde_json::{Value, json};
 use super::broker_client::{BrokerClient, resolve_session};
 use crate::protocol::{LiveState, Role};
 
-/// Default time the broker waits for a plugin to answer a command.
 const COMMAND_TIMEOUT_MS: u64 = 30_000;
 
-/// Schema for a field that accepts any JSON value (Roblox property / attribute
-/// values: scalars, typed specs like `{type,value}`, arrays, or maps). schemars
-/// renders a bare `serde_json::Value` with no `type`, which Claude Code's tool
-/// validator rejects — one such property fails the entire `tools/list` fetch, so
-/// every tool disappears. Emitting an explicit type union keeps it valid.
 fn any_json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": ["string", "integer", "number", "boolean", "array", "object", "null"]
     })
 }
 
-/// Schema for a field that accepts a JSON object (a name->value map or nested spec).
-/// Same rationale as [`any_json_schema`]: a typed schema, not a bare `Value`.
 fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "object" })
 }
@@ -47,7 +42,6 @@ pub struct DustServer {
     tool_router: ToolRouter<Self>,
 }
 
-/// Optional session selector shared by every place-targeting tool (§3).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SessionSelector {
     /// Session id or label to target. May be omitted only when exactly one
@@ -57,7 +51,6 @@ struct SessionSelector {
     session: Option<String>,
 }
 
-/// Arguments for `grep_scripts`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GrepArgs {
     #[serde(default)]
@@ -84,7 +77,6 @@ struct GrepArgs {
     root: Option<String>,
 }
 
-/// Arguments for `search_instances`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchInstancesArgs {
     #[serde(default)]
@@ -119,7 +111,6 @@ struct SearchInstancesArgs {
     cursor: Option<String>,
 }
 
-/// Arguments for `search_by_property`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchByPropertyArgs {
     #[serde(default)]
@@ -141,7 +132,6 @@ struct SearchByPropertyArgs {
     root: Option<String>,
 }
 
-/// Arguments for `get_script_source`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetScriptSourceArgs {
     #[serde(default)]
@@ -156,7 +146,6 @@ struct GetScriptSourceArgs {
     end_line: Option<u32>,
 }
 
-/// Arguments for `read_output`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadOutputArgs {
     #[serde(default)]
@@ -172,7 +161,6 @@ struct ReadOutputArgs {
     clear: Option<bool>,
 }
 
-/// Arguments for `run_luau`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RunLuauArgs {
     #[serde(default)]
@@ -182,7 +170,6 @@ struct RunLuauArgs {
     code: String,
 }
 
-/// Arguments for `run_server_code`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RunServerCodeArgs {
     #[serde(default)]
@@ -192,7 +179,6 @@ struct RunServerCodeArgs {
     code: String,
 }
 
-/// Arguments for `read_server_output`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadServerOutputArgs {
     #[serde(default)]
@@ -202,7 +188,6 @@ struct ReadServerOutputArgs {
     limit: Option<u32>,
 }
 
-/// Arguments for `read_client_output`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadClientOutputArgs {
     #[serde(default)]
@@ -212,7 +197,6 @@ struct ReadClientOutputArgs {
     limit: Option<u32>,
 }
 
-/// One simulated key event for `keyboard_input`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct KeyEvent {
     /// KeyCode name, e.g. "W", "Space", "LeftShift" (resolved via `Enum.KeyCode`).
@@ -225,43 +209,58 @@ struct KeyEvent {
     duration: Option<f64>,
 }
 
-/// Arguments for `keyboard_input`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct KeyboardInputArgs {
     #[serde(default)]
     session: Option<String>,
-    /// Ordered key events to simulate in the play client (via VirtualUser).
+    /// Ordered batch of key events to simulate in the play client (via VirtualInput).
     #[serde(default)]
     keys: Vec<KeyEvent>,
-    /// Optional text to type character-by-character after the key events.
+    /// Optional text to inject as a single text-input event after the key events
+    /// (routed to the focused TextBox / text handler via `SendTextInput`).
     #[serde(default)]
     text: Option<String>,
 }
 
-/// Arguments for `mouse_input`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct MouseEvent {
+    /// "move", "click", "down", "up", "scroll", or "delta".
+    action: String,
+    /// Target X in viewport pixels (move / click / down / up / scroll).
+    #[serde(default)]
+    x: Option<f64>,
+    /// Target Y in viewport pixels (move / click / down / up / scroll).
+    #[serde(default)]
+    y: Option<f64>,
+    /// "left", "right", or "middle" (defaults to "left"). For click/down/up.
+    #[serde(default)]
+    button: Option<String>,
+    /// For "scroll": wheel delta (positive = forward, negative = backward).
+    #[serde(default)]
+    scroll: Option<f64>,
+    /// For "delta": relative X movement in pixels (requires a locked cursor).
+    #[serde(default)]
+    dx: Option<f64>,
+    /// For "delta": relative Y movement in pixels (requires a locked cursor).
+    #[serde(default)]
+    dy: Option<f64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MouseInputArgs {
     #[serde(default)]
     session: Option<String>,
-    /// "move", "click", "down", or "up".
-    action: String,
-    /// Target X in viewport pixels.
+    /// Ordered batch of mouse events to simulate in the play client (via VirtualInput).
     #[serde(default)]
-    x: Option<f64>,
-    /// Target Y in viewport pixels.
-    #[serde(default)]
-    y: Option<f64>,
-    /// "left" or "right" (defaults to "left").
-    #[serde(default)]
-    button: Option<String>,
+    events: Vec<MouseEvent>,
 }
 
-/// Arguments for `character_navigation`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CharacterNavigationArgs {
     #[serde(default)]
     session: Option<String>,
-    /// "move" (a direction for a duration), "move_to" (walk to x,y,z), "jump", or "stop".
+    /// "move" (a direction for a duration), "move_to" (pathfind to x,y,z via
+    /// PathfindingService, walking the waypoints; straight-line fallback), "jump", or "stop".
     action: String,
     /// For "move": "forward" / "back" / "left" / "right"; omit to use a raw x,z direction.
     #[serde(default)]
@@ -279,9 +278,6 @@ struct CharacterNavigationArgs {
     #[serde(default)]
     relative_to_camera: Option<bool>,
 }
-
-// ---- Editor-suite argument types (instances addressed by `path` dot-notation
-// or a DebugId `handle` from a search result). ----
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PathArgs {
@@ -650,7 +646,6 @@ struct ClassInfoArgs {
     class_name: String,
 }
 
-/// Build the shared `{path?, handle?}` target map most editor tools forward.
 fn target(path: &Option<String>, handle: &Option<String>) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     if let Some(p) = path {
@@ -909,8 +904,6 @@ impl DustServer {
             .await
     }
 
-    // ---- Client playtest suite (role=client, proxied to the play client via the relay) ----
-
     #[tool(
         description = "Read recent client-side Output during a playtest (the local player's \
                        LogService; differs from server output). Routed to the play client via the relay."
@@ -937,7 +930,8 @@ impl DustServer {
 
     #[tool(
         description = "Navigate the local player's character during a playtest: move in a direction \
-                       for a duration, walk to a point (move_to), jump, or stop. Drives the client Humanoid."
+                       for a duration, walk to a point (move_to — routes around obstacles via \
+                       PathfindingService, straight-line fallback), jump, or stop. Drives the client Humanoid."
     )]
     async fn character_navigation(
         &self,
@@ -957,8 +951,10 @@ impl DustServer {
     }
 
     #[tool(
-        description = "Simulate keyboard input in the play client (via VirtualUser): a sequence of \
-                       key down/up/tap events and/or typed text. Requires an active playtest."
+        description = "Simulate keyboard input in the play client via VirtualInput \
+                       (UserInputService:CreateVirtualInput()): an ordered batch of key \
+                       down/up/tap events, plus optional text injected via SendTextInput. \
+                       Each event is reported with its own ok/error. Requires an active playtest."
     )]
     async fn keyboard_input(
         &self,
@@ -970,24 +966,18 @@ impl DustServer {
     }
 
     #[tool(
-        description = "Simulate mouse input in the play client (via VirtualUser): move / click / \
-                       down / up at viewport pixel coordinates. Requires an active playtest."
+        description = "Simulate mouse input in the play client via VirtualInput: an ordered batch \
+                       of events (move / click / down / up / scroll / delta) at viewport pixel \
+                       coordinates. Each event is reported with its own ok/error. Requires an active playtest."
     )]
     async fn mouse_input(
         &self,
         Parameters(a): Parameters<MouseInputArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({
-            "action": a.action,
-            "x": a.x,
-            "y": a.y,
-            "button": a.button,
-        });
+        let args = json!({ "events": a.events });
         self.run_tool("mouse_input", args, Role::Client, COMMAND_TIMEOUT_MS, a.session.as_deref())
             .await
     }
-
-    // ---- Editor suite: instance introspection ----
 
     #[tool(description = "Get an instance's direct children (by path or handle). Each child as {name, class, path, handle}.")]
     async fn get_instance_children(&self, Parameters(a): Parameters<PathArgs>) -> Result<CallToolResult, ErrorData> {
@@ -1051,8 +1041,6 @@ impl DustServer {
         self.run_plugin_tool("compare_instances", json!({ "a": a.a, "b": a.b }), a.session.as_deref()).await
     }
 
-    // ---- Editor suite: search ----
-
     #[tool(description = "Find instances by name pattern and/or class under a root. Returns {name, class, path, handle} pages.")]
     async fn search_objects(&self, Parameters(a): Parameters<SearchObjArgs>) -> Result<CallToolResult, ErrorData> {
         let mut m = target(&a.path, &a.handle);
@@ -1077,8 +1065,6 @@ impl DustServer {
         }
         self.run_plugin_tool("search_files", Value::Object(m), a.session.as_deref()).await
     }
-
-    // ---- Editor suite: tags ----
 
     #[tool(description = "Get an instance's CollectionService tags.")]
     async fn get_tags(&self, Parameters(a): Parameters<PathArgs>) -> Result<CallToolResult, ErrorData> {
@@ -1108,8 +1094,6 @@ impl DustServer {
         }
         self.run_plugin_tool("get_tagged", Value::Object(m), a.session.as_deref()).await
     }
-
-    // ---- Editor suite: attributes ----
 
     #[tool(description = "Read one attribute of an instance.")]
     async fn get_attribute(&self, Parameters(a): Parameters<AttrNameArgs>) -> Result<CallToolResult, ErrorData> {
@@ -1145,8 +1129,6 @@ impl DustServer {
         self.run_plugin_tool("bulk_set_attributes", Value::Object(m), a.session.as_deref()).await
     }
 
-    // ---- Editor suite: properties ----
-
     #[tool(description = "Set one property. `value` may be a primitive, a typed {type,value} spec, or a bare string for an enum.")]
     async fn set_property(&self, Parameters(a): Parameters<SetPropArgs>) -> Result<CallToolResult, ErrorData> {
         let mut m = target(&a.path, &a.handle);
@@ -1171,8 +1153,6 @@ impl DustServer {
     async fn mass_get_property(&self, Parameters(a): Parameters<MassGetArgs>) -> Result<CallToolResult, ErrorData> {
         self.run_plugin_tool("mass_get_property", json!({ "property": a.property, "targets": a.targets }), a.session.as_deref()).await
     }
-
-    // ---- Editor suite: instance lifecycle (undoable) ----
 
     #[tool(description = "Create an instance of `class_name` under `parent` (path or handle), optionally named.")]
     async fn create_object(&self, Parameters(a): Parameters<CreateArgs>) -> Result<CallToolResult, ErrorData> {
@@ -1262,8 +1242,6 @@ impl DustServer {
         self.run_plugin_tool("redo", json!({}), a.session.as_deref()).await
     }
 
-    // ---- Editor suite: script editing ----
-
     #[tool(description = "Replace a script's entire source.")]
     async fn set_script_source(&self, Parameters(a): Parameters<SetSourceArgs>) -> Result<CallToolResult, ErrorData> {
         let mut m = target(&a.path, &a.handle);
@@ -1321,9 +1299,6 @@ impl DustServer {
 }
 
 impl DustServer {
-    /// Orchestrate stopping a playtest: end F5 via the server helper (only if one
-    /// is live — otherwise report clearly instead of hanging, §6), then strip the
-    /// injected helpers from the edit DataModel via the plugin.
     async fn stop_playtest_impl(&self, selector: Option<&str>) -> Result<CallToolResult, ErrorData> {
         let sessions = match self.broker.list_sessions().await {
             Ok(sessions) => sessions,
@@ -1363,7 +1338,6 @@ impl DustServer {
             );
         }
 
-        // Strip helpers from the edit DataModel regardless (plugin role).
         let cleanup = self
             .broker
             .command(&session_id, "cleanup_helpers", json!({}), Role::Plugin, 15_000)
@@ -1379,8 +1353,6 @@ impl DustServer {
         ok_json(&Value::Object(report))
     }
 
-    /// Dispatch a command to a session's `plugin` role and turn the result into
-    /// a tool response. The common case for edit-context tools.
     async fn run_plugin_tool(
         &self,
         tool: &str,
@@ -1390,8 +1362,6 @@ impl DustServer {
         self.run_tool(tool, args, Role::Plugin, COMMAND_TIMEOUT_MS, selector).await
     }
 
-    /// Resolve the target session, dispatch a command to a given role, and turn
-    /// the result into a tool response.
     async fn run_tool(
         &self,
         tool: &str,
@@ -1440,13 +1410,10 @@ impl ServerHandler for DustServer {
     }
 }
 
-/// Wrap a serializable value as a successful tool result (JSON text content).
 fn ok_json<T: serde::Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![Content::json(value)?]))
 }
 
-/// A tool-level error the model can see and recover from (e.g. by calling
-/// list_sessions), as opposed to a protocol error.
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }

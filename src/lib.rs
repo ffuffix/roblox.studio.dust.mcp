@@ -1,7 +1,6 @@
 //! Dust — a reliable Roblox Studio MCP.
 //!
-//! The crate is organized around the broker-daemon topology described in
-//! `roblox-studio-mcp-approach.md`:
+//! The crate is built around a broker-daemon topology:
 //!
 //! - [`protocol`] — the wire schema shared by every process.
 //! - [`discovery`] — adapter↔broker filesystem rendezvous (`broker.json`).

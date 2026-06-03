@@ -11,7 +11,6 @@ use tokio::net::TcpListener;
 
 const TOKEN: &str = "test-token-abc123";
 
-/// Bring up the broker on an ephemeral port and return its base URL.
 async fn spawn_broker() -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -72,9 +71,6 @@ async fn adapter_endpoints_require_token() {
 async fn empty_poll_returns_204() {
     let base = spawn_broker().await;
     let client = reqwest::Client::new();
-    // Short hold isn't configurable per-request, so use a small timeout to keep
-    // the test fast: a freshly registered session has nothing queued, and we
-    // only need to confirm the *shape* is 204 — abort the wait early.
     let resp = tokio::time::timeout(
         Duration::from_millis(800),
         client
@@ -83,8 +79,6 @@ async fn empty_poll_returns_204() {
             .send(),
     )
     .await;
-    // The poll holds ~25s; our 800ms client-side timeout elapsing is the
-    // expected "nothing queued" outcome.
     assert!(resp.is_err(), "expected the long-poll to still be holding");
 }
 
@@ -94,8 +88,6 @@ async fn full_command_loop_with_result() {
     let client = reqwest::Client::new();
     let session_id = "s-loop";
 
-    // 1. Plugin registers and parks on a single poll. Capture whatever that
-    //    poll ultimately returns — it is the one that will receive the command.
     let (tx, rx) = tokio::sync::oneshot::channel();
     let poll_base = base.clone();
     tokio::spawn(async move {
@@ -114,11 +106,8 @@ async fn full_command_loop_with_result() {
         };
         let _ = tx.send((status, body));
     });
-    // Give the poll time to register the session and park.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // 2. Adapter enqueues a command and awaits the result. The enqueue wakes
-    //    the parked poll above.
     let cmd_base = base.clone();
     let cmd_task = tokio::spawn(async move {
         let c = reqwest::Client::new();
@@ -136,7 +125,6 @@ async fn full_command_loop_with_result() {
             .unwrap()
     });
 
-    // 3. The parked poll returns the queued command.
     let (status, body) = rx.await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK);
     let commands = body["commands"].as_array().unwrap();
@@ -146,7 +134,6 @@ async fn full_command_loop_with_result() {
     assert_eq!(cmd["targetRole"], "plugin");
     let cmd_id = cmd["id"].as_u64().unwrap();
 
-    // 4. Plugin posts the result, echoing the id.
     let res = client
         .post(format!("{base}/result"))
         .json(&json!({
@@ -161,7 +148,6 @@ async fn full_command_loop_with_result() {
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 
-    // 5. The adapter's command call resolves with that result.
     let cmd_resp = cmd_task.await.unwrap();
     assert_eq!(cmd_resp.status(), reqwest::StatusCode::OK);
     let result: Value = cmd_resp.json().await.unwrap();
@@ -169,7 +155,6 @@ async fn full_command_loop_with_result() {
     assert_eq!(result["ok"], true);
     assert_eq!(result["result"]["pong"], true);
 
-    // 6. The session now shows up in list_sessions as live.
     let sessions: Vec<SessionInfo> = client
         .get(format!("{base}/sessions"))
         .bearer_auth(TOKEN)
@@ -206,8 +191,6 @@ async fn command_to_unknown_session_is_404() {
 
 #[tokio::test]
 async fn command_routes_to_the_targeted_role() {
-    // The playtest flow (step 5) relies on routing a command to the `server`
-    // role while the `plugin` role of the same session is also connected.
     let base = spawn_broker().await;
     let client = reqwest::Client::new();
     let session_id = "s-roles";
@@ -216,8 +199,6 @@ async fn command_routes_to_the_targeted_role() {
         json!({ "sessionId": session_id, "role": role, "protocol": PROTOCOL_VERSION, "ts": 0 })
     };
 
-    // Register the plugin role with a poll that parks (and should NOT receive
-    // the server-targeted command).
     let (plugin_tx, plugin_rx) = tokio::sync::oneshot::channel();
     {
         let base = base.clone();
@@ -228,7 +209,6 @@ async fn command_routes_to_the_targeted_role() {
             let _ = plugin_tx.send(resp.status());
         });
     }
-    // Register the server role and capture what its poll returns.
     let (server_tx, server_rx) = tokio::sync::oneshot::channel();
     {
         let base = base.clone();
@@ -246,7 +226,6 @@ async fn command_routes_to_the_targeted_role() {
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Enqueue a command for the SERVER role.
     let cmd_base = base.clone();
     let cmd_task = tokio::spawn(async move {
         let c = reqwest::Client::new();
@@ -264,7 +243,6 @@ async fn command_routes_to_the_targeted_role() {
             .unwrap()
     });
 
-    // The server poll receives it; the plugin poll stays parked (no delivery).
     let server_body = server_rx.await.unwrap();
     let commands = server_body["commands"].as_array().unwrap();
     assert_eq!(commands.len(), 1);
@@ -275,7 +253,6 @@ async fn command_routes_to_the_targeted_role() {
         "plugin poll must not receive a server-targeted command"
     );
 
-    // Server posts the result -> the adapter's command call resolves.
     client
         .post(format!("{base}/result"))
         .json(&json!({ "sessionId": session_id, "role": "server", "id": cmd_id, "ok": true, "result": { "ending": true } }))
@@ -290,11 +267,6 @@ async fn command_routes_to_the_targeted_role() {
 
 #[tokio::test]
 async fn command_routes_to_the_client_role() {
-    // The step-6 client tools (read_client_output / get_client_state /
-    // character_navigation / keyboard_input / mouse_input) route to the `client`
-    // role. In production the play server proxies that queue over a RemoteEvent
-    // (the client has no HttpService), but the broker routing itself must deliver
-    // a client-targeted command only to the client queue.
     let base = spawn_broker().await;
     let client = reqwest::Client::new();
     let session_id = "s-client";
@@ -303,7 +275,6 @@ async fn command_routes_to_the_client_role() {
         json!({ "sessionId": session_id, "role": role, "protocol": PROTOCOL_VERSION, "ts": 0 })
     };
 
-    // Server role parks and must NOT receive the client-targeted command.
     let (server_tx, server_rx) = tokio::sync::oneshot::channel();
     {
         let base = base.clone();
@@ -314,7 +285,6 @@ async fn command_routes_to_the_client_role() {
             let _ = server_tx.send(resp.status());
         });
     }
-    // Client role poll captures what it receives.
     let (client_tx, client_rx) = tokio::sync::oneshot::channel();
     {
         let base = base.clone();
@@ -332,7 +302,6 @@ async fn command_routes_to_the_client_role() {
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Enqueue a command for the CLIENT role.
     let cmd_base = base.clone();
     let cmd_task = tokio::spawn(async move {
         let c = reqwest::Client::new();
@@ -350,7 +319,6 @@ async fn command_routes_to_the_client_role() {
             .unwrap()
     });
 
-    // The client poll receives it; the server poll stays parked (no delivery).
     let client_body = client_rx.await.unwrap();
     let commands = client_body["commands"].as_array().unwrap();
     assert_eq!(commands.len(), 1);
@@ -361,7 +329,6 @@ async fn command_routes_to_the_client_role() {
         "server poll must not receive a client-targeted command"
     );
 
-    // Client posts the result -> the adapter's command call resolves.
     client
         .post(format!("{base}/result"))
         .json(&json!({ "sessionId": session_id, "role": "client", "id": cmd_id, "ok": true, "result": { "player": "Player1" } }))

@@ -1,6 +1,6 @@
 //! Spawn-or-attach: the adapter discovers a running broker via `broker.json`
 //! and health-checks it, or forks a fresh `dust broker` and waits for it to
-//! come up (§2). The forked broker is detached so it outlives the adapter —
+//! come up. The forked broker is detached so it outlives the adapter —
 //! restarting Claude must not drop live Studio sessions.
 
 use std::process::{Command, Stdio};
@@ -12,12 +12,9 @@ use super::broker_client::BrokerClient;
 use crate::discovery;
 use crate::protocol::{BrokerInfo, PROTOCOL_VERSION};
 
-/// How long to wait for a freshly forked broker to publish `broker.json` and
-/// answer `/health`.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Return a healthy broker, attaching to an existing one or forking a new one.
 pub async fn ensure_broker() -> Result<BrokerInfo> {
     if let Some(info) = discovery::read_broker_info() {
         if health_ok(&info).await {
@@ -31,8 +28,6 @@ pub async fn ensure_broker() -> Result<BrokerInfo> {
     wait_for_broker().await
 }
 
-/// `true` if the broker at `info` answers `/health` and its identity matches —
-/// guards against attaching to a stale entry or a foreign listener (§2, §8).
 async fn health_ok(info: &BrokerInfo) -> bool {
     let client = BrokerClient::new(info);
     match client.health().await {
@@ -41,9 +36,6 @@ async fn health_ok(info: &BrokerInfo) -> bool {
     }
 }
 
-/// Fork `dust broker` as a detached child with stdio kept off the adapter's
-/// stdout (which carries MCP JSON-RPC). Broker logs are appended to
-/// `~/.rbxmcp/broker.log` when possible.
 fn fork_broker() -> Result<()> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let mut cmd = Command::new(exe);
@@ -58,8 +50,6 @@ fn fork_broker() -> Result<()> {
         }
     }
 
-    // Detach into its own process group so a signal to the adapter's group
-    // (e.g. Ctrl-C in a terminal) does not also kill the broker.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -71,7 +61,7 @@ fn fork_broker() -> Result<()> {
 }
 
 fn log_file() -> Option<std::fs::File> {
-    let dir = discovery::rbxmcp_dir().ok()?;
+    let dir = discovery::dust_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)

@@ -1,5 +1,5 @@
 //! The adapter's HTTP client to the broker, plus the session disambiguation
-//! rule (§3). The client speaks the authenticated adapter surface
+//! rule. The client speaks the authenticated adapter surface
 //! (`/sessions`, `/command`, `/shutdown`) over loopback.
 
 use std::time::Duration;
@@ -9,9 +9,6 @@ use serde_json::{Value, json};
 
 use crate::protocol::{BrokerInfo, CommandResult, Health, LiveState, Role, SessionInfo};
 
-/// Extra slack added on top of a command's broker-side timeout before the
-/// client-side request gives up, so the broker's own `504` wins the race and we
-/// surface its message rather than a generic transport timeout.
 const CLIENT_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
 pub struct BrokerClient {
@@ -29,7 +26,6 @@ impl BrokerClient {
         }
     }
 
-    /// Unauthenticated discovery probe.
     pub async fn health(&self) -> Result<Health> {
         let resp = self
             .http
@@ -53,7 +49,6 @@ impl BrokerClient {
         Ok(resp.json().await?)
     }
 
-    /// Enqueue a command for a session's role and wait for the plugin's result.
     pub async fn command(
         &self,
         session_id: &str,
@@ -86,7 +81,6 @@ impl BrokerClient {
         }
     }
 
-    /// Ask the broker to shut down (used by tooling; not on the normal path).
     pub async fn shutdown(&self) -> Result<()> {
         self.http
             .post(format!("{}/shutdown", self.base))
@@ -99,12 +93,10 @@ impl BrokerClient {
     }
 }
 
-/// A session has a live connection if any of its roles is `Live`.
 fn is_live(s: &SessionInfo) -> bool {
     s.roles.iter().any(|r| r.state == LiveState::Live)
 }
 
-/// Short human description of a session for ambiguity errors.
 fn describe(s: &SessionInfo) -> String {
     let name = if s.place_name.is_empty() { "<unnamed>" } else { &s.place_name };
     match &s.label {
@@ -113,11 +105,6 @@ fn describe(s: &SessionInfo) -> String {
     }
 }
 
-/// Resolve a session selector to a concrete `sessionId`, enforcing the §3
-/// disambiguation rule: default to the sole live session, but **never guess**
-/// when several are live — force a `list_sessions` call instead.
-///
-/// `Err` carries a model-facing message explaining how to proceed.
 pub fn resolve_session(sessions: &[SessionInfo], selector: Option<&str>) -> Result<String, String> {
     if let Some(sel) = selector {
         return sessions

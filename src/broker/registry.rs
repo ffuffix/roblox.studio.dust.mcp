@@ -1,6 +1,6 @@
 //! The broker's single source of truth: the session registry, per-role command
 //! queues, and the correlation table that lets an adapter await a plugin's
-//! result (§1, §3, §4).
+//! result.
 //!
 //! Concurrency rules followed throughout:
 //! - The `DashMap`s are sharded locks; we never hold a `Ref`/`RefMut` across an
@@ -22,16 +22,10 @@ use crate::protocol::{
     Command, CommandResult, Handshake, LiveState, Role, RoleInfo, SessionInfo,
 };
 
-/// A delivered-but-unacked command is redelivered on a later poll if it has
-/// been outstanding this long. Handles a lost poll response or a reconnect
-/// without busy-looping on freshly delivered work (the plugin dedups by id).
 const REDELIVER_AFTER: Duration = Duration::from_secs(15);
-/// A role unseen for longer than this is `Stale`.
 pub const STALE_AFTER: Duration = Duration::from_secs(40);
-/// A role unseen for longer than this is `Dead` and eligible for reaping.
 pub const DEAD_AFTER: Duration = Duration::from_secs(120);
 
-/// Mutable per-session metadata, refreshed from each handshake.
 #[derive(Clone, Debug, Default)]
 pub struct SessionMeta {
     pub place_id: u64,
@@ -52,8 +46,6 @@ impl SessionMeta {
         }
     }
 
-    /// Merge a fresh handshake in. A handshake never clears an existing label
-    /// with `None`, so a label assigned once sticks.
     fn update_from(&mut self, hs: &Handshake) {
         self.place_id = hs.place_id;
         self.game_id = hs.game_id;
@@ -67,20 +59,14 @@ impl SessionMeta {
     }
 }
 
-/// The FIFO command queue for one role of one session, with at-least-once
-/// delivery and idempotent acks (§4).
 pub struct RoleQueue {
-    /// Woken whenever a command is enqueued, so a parked long-poll re-checks.
     pub notify: Notify,
     inner: Mutex<RoleQueueInner>,
 }
 
 struct RoleQueueInner {
     last_seen: Instant,
-    /// Never-delivered commands, in FIFO order.
     undelivered: VecDeque<Command>,
-    /// Delivered-but-unacked commands with the time they were last handed out,
-    /// keyed by id for ordered iteration and O(log n) ack.
     inflight: BTreeMap<u64, (Command, Instant)>,
 }
 
@@ -96,7 +82,6 @@ impl RoleQueue {
         }
     }
 
-    /// Record a heartbeat for this role.
     pub fn touch(&self) {
         self.inner.lock().unwrap().last_seen = Instant::now();
     }
@@ -105,17 +90,11 @@ impl RoleQueue {
         self.inner.lock().unwrap().last_seen
     }
 
-    /// Queue a command and wake any parked poll.
     pub fn enqueue(&self, cmd: Command) {
         self.inner.lock().unwrap().undelivered.push_back(cmd);
-        // notify_waiters does not store a permit, but that is fine: a poll that
-        // arrives later re-checks the queue before parking, so no wakeup is lost.
         self.notify.notify_waiters();
     }
 
-    /// Drain the work to return for a poll: every never-delivered command (now
-    /// moved to in-flight) plus any in-flight command stale enough to redeliver.
-    /// Returns commands sorted by id with no duplicates.
     pub fn take_for_poll(&self) -> Vec<Command> {
         let now = Instant::now();
         let mut guard = self.inner.lock().unwrap();
@@ -136,7 +115,6 @@ impl RoleQueue {
         out
     }
 
-    /// Mark a command acknowledged (idempotent — a duplicate ack is a no-op).
     pub fn ack(&self, id: u64) {
         let mut guard = self.inner.lock().unwrap();
         guard.inflight.remove(&id);
@@ -144,7 +122,6 @@ impl RoleQueue {
     }
 }
 
-/// One place launch, grouping up to three role queues that share a `sessionId`.
 pub struct Session {
     pub meta: Mutex<SessionMeta>,
     next_id: AtomicU64,
@@ -160,12 +137,10 @@ impl Session {
         }
     }
 
-    /// Allocate the next monotonic command id for this session.
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Get or create the queue for a role.
     pub fn role_queue(&self, role: Role) -> Arc<RoleQueue> {
         self.roles
             .entry(role)
@@ -173,7 +148,6 @@ impl Session {
             .clone()
     }
 
-    /// Route a command to its target role's queue.
     pub fn enqueue(&self, cmd: Command) {
         self.role_queue(cmd.target_role).enqueue(cmd);
     }
@@ -196,7 +170,6 @@ impl Session {
         infos
     }
 
-    /// `true` if any role has been seen recently enough to count as live.
     fn has_live_role(&self) -> bool {
         let now = Instant::now();
         self.roles
@@ -204,7 +177,6 @@ impl Session {
             .any(|e| now.duration_since(e.value().last_seen()) < STALE_AFTER)
     }
 
-    /// `true` if every role is dead (or there are none) — eligible for reaping.
     fn all_dead(&self) -> bool {
         let now = Instant::now();
         self.roles
@@ -223,11 +195,9 @@ fn state_for(ago: Duration) -> LiveState {
     }
 }
 
-/// The broker-wide registry.
 #[derive(Default)]
 pub struct Registry {
     sessions: DashMap<String, Arc<Session>>,
-    /// Adapters awaiting a result, keyed by `(sessionId, commandId)`.
     pending: DashMap<(String, u64), oneshot::Sender<CommandResult>>,
 }
 
@@ -236,8 +206,6 @@ impl Registry {
         Self::default()
     }
 
-    /// Register or refresh a session+role from a handshake, returning the
-    /// session. Records the heartbeat for the role.
     pub fn upsert(&self, hs: &Handshake) -> Arc<Session> {
         let session = self
             .sessions
@@ -253,7 +221,6 @@ impl Registry {
         self.sessions.get(session_id).map(|e| e.value().clone())
     }
 
-    /// Snapshot of all sessions for `list_sessions`.
     pub fn list(&self) -> Vec<SessionInfo> {
         self.sessions
             .iter()
@@ -273,7 +240,6 @@ impl Registry {
             .collect()
     }
 
-    /// Count sessions with at least one live role (for idle-shutdown).
     pub fn live_session_count(&self) -> usize {
         self.sessions
             .iter()
@@ -281,7 +247,6 @@ impl Registry {
             .count()
     }
 
-    /// Drop sessions whose every role is dead. Returns the number removed.
     pub fn reap(&self) -> usize {
         let dead: Vec<String> = self
             .sessions
@@ -295,19 +260,16 @@ impl Registry {
         dead.len()
     }
 
-    /// Register interest in a command's result, returning the receiver to await.
     pub fn register_pending(&self, session_id: &str, id: u64) -> oneshot::Receiver<CommandResult> {
         let (tx, rx) = oneshot::channel();
         self.pending.insert((session_id.to_string(), id), tx);
         rx
     }
 
-    /// Abandon interest in a result (e.g. on adapter timeout).
     pub fn cancel_pending(&self, session_id: &str, id: u64) {
         self.pending.remove(&(session_id.to_string(), id));
     }
 
-    /// Deliver a result to any waiting adapter. Returns `true` if one was waiting.
     pub fn complete(&self, session_id: &str, result: CommandResult) -> bool {
         if let Some((_, tx)) = self.pending.remove(&(session_id.to_string(), result.id)) {
             tx.send(result).is_ok()

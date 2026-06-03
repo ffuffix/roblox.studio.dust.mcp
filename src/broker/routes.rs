@@ -1,4 +1,4 @@
-//! Axum router and handlers for the broker (§4).
+//! Axum router and handlers for the broker.
 //!
 //! Endpoint groups:
 //! - Public discovery:   `GET  /health`
@@ -25,10 +25,7 @@ use crate::protocol::{
 
 use super::AppState;
 
-/// How long a poll is held open before returning `204` (§4: under HttpService's
-/// timeout, ~30s).
 const POLL_HOLD: Duration = Duration::from_secs(25);
-/// Default ceiling for how long an adapter's `command` call waits for a result.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -42,25 +39,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-// ---- Public discovery -----------------------------------------------------
-
 async fn health(State(st): State<Arc<AppState>>) -> JsonResponse<Health> {
     Json(st.health.clone())
 }
 
-// ---- Participant endpoints ------------------------------------------------
-
-/// Long-poll. Registers/refreshes the role, then returns queued commands or
-/// holds up to [`POLL_HOLD`] before a `204`.
 async fn poll(State(st): State<Arc<AppState>>, Json(hs): Json<Handshake>) -> Response {
     let session = st.registry.upsert(&hs);
-    // Clone the Arc out so we don't hold any DashMap ref across the await below.
     let queue = session.role_queue(hs.role);
     let deadline = Instant::now() + POLL_HOLD;
 
     loop {
-        // Arm the notification *before* checking the queue so an enqueue that
-        // races with us can't be missed.
         let notified = queue.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -90,8 +78,6 @@ struct ResultRequest {
     result: CommandResult,
 }
 
-/// A participant posts a command result. We ack the queue (idempotent) and hand
-/// the result to any waiting adapter.
 async fn result(State(st): State<Arc<AppState>>, Json(req): Json<ResultRequest>) -> StatusCode {
     let id = req.result.id;
     if let Some(session) = st.registry.get(&req.session_id) {
@@ -101,9 +87,6 @@ async fn result(State(st): State<Arc<AppState>>, Json(req): Json<ResultRequest>)
     StatusCode::OK
 }
 
-// ---- Adapter endpoints ----------------------------------------------------
-
-/// Validate the adapter's bearer token and record activity (resets idle timer).
 fn authorize(st: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     let provided = headers
         .get("authorization")
@@ -140,8 +123,6 @@ struct CommandRequest {
     timeout_ms: Option<u64>,
 }
 
-/// Enqueue a command for a session and wait for its result. This is the shape
-/// an MCP tool call maps onto: enqueue → plugin executes → result returns.
 async fn command(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -155,7 +136,6 @@ async fn command(
         .ok_or((StatusCode::NOT_FOUND, format!("no session {}", req.session_id)))?;
 
     let id = session.next_id();
-    // Register interest before enqueueing so we cannot miss a fast result.
     let rx = st.registry.register_pending(&req.session_id, id);
     session.enqueue(Command {
         id,
