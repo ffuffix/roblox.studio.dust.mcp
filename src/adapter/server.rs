@@ -197,6 +197,15 @@ struct ReadClientOutputArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadPlaytestOutputArgs {
+    #[serde(default)]
+    session: Option<String>,
+    /// Maximum number of (most recent) merged log lines to return across both roles.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct KeyEvent {
     /// KeyCode name, e.g. "W", "Space", "LeftShift" (resolved via `Enum.KeyCode`).
@@ -894,7 +903,9 @@ impl DustServer {
 
     #[tool(
         description = "Read recent server-side Output during an F5 playtest via the server helper \
-                       (server logs may differ from the edit-context output)."
+                       (server logs may differ from the edit-context output). NOTE: in Play Solo a \
+                       server Script's prints surface via the CLIENT log, so this can look empty — \
+                       prefer read_playtest_output, which merges both roles."
     )]
     async fn read_server_output(
         &self,
@@ -906,7 +917,8 @@ impl DustServer {
 
     #[tool(
         description = "Read recent client-side Output during a playtest (the local player's \
-                       LogService; differs from server output). Routed to the play client via the relay."
+                       LogService). In Play Solo this also captures server Script prints. Routed to \
+                       the play client via the relay. For a full picture, prefer read_playtest_output."
     )]
     async fn read_client_output(
         &self,
@@ -914,6 +926,21 @@ impl DustServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.run_tool("read_client_output", json!({ "limit": a.limit.unwrap_or(200) }), Role::Client, COMMAND_TIMEOUT_MS, a.session.as_deref())
             .await
+    }
+
+    #[tool(
+        description = "Read combined playtest Output (server + client) in ONE call, role-tagged and \
+                       time-ordered. Only queries roles that are live (no hang waiting on a role that \
+                       isn't connected). In Play Solo, server-script prints surface via the client \
+                       log, so this merges both so you don't have to guess which log to read. Use it \
+                       to observe output and then take more actions on the fly during a playtest. \
+                       (For the edit/F8 Output window, use read_output instead.)"
+    )]
+    async fn read_playtest_output(
+        &self,
+        Parameters(a): Parameters<ReadPlaytestOutputArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.read_playtest_output_impl(a.session.as_deref(), a.limit.unwrap_or(200)).await
     }
 
     #[tool(
@@ -1349,6 +1376,87 @@ impl DustServer {
                 Err(e) => json!({ "ok": false, "error": e.to_string() }),
             },
         );
+
+        ok_json(&Value::Object(report))
+    }
+
+    /// Merge the server- and client-helper Output into one role-tagged, time-ordered
+    /// stream. Only live roles are queried (so we never hang on a disconnected role),
+    /// and a per-role failure is reported inline rather than failing the whole call.
+    async fn read_playtest_output_impl(
+        &self,
+        selector: Option<&str>,
+        limit: u32,
+    ) -> Result<CallToolResult, ErrorData> {
+        let sessions = match self.broker.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => return Ok(tool_error(format!("failed to reach broker: {e}"))),
+        };
+        let session_id = match resolve_session(&sessions, selector) {
+            Ok(id) => id,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
+        let session = sessions.iter().find(|s| s.session_id == session_id);
+        let role_live = |role: Role| {
+            session.is_some_and(|s| s.roles.iter().any(|r| r.role == role && r.state == LiveState::Live))
+        };
+
+        let mut report = serde_json::Map::new();
+        report.insert("sessionId".into(), json!(session_id));
+
+        let mut merged: Vec<Value> = Vec::new();
+        let mut any_live = false;
+
+        // (role, tool name, report key)
+        let roles = [
+            (Role::Server, "read_server_output", "server"),
+            (Role::Client, "read_client_output", "client"),
+        ];
+        for (role, tool, key) in roles {
+            if !role_live(role) {
+                report.insert(key.into(), json!({ "live": false }));
+                continue;
+            }
+            any_live = true;
+            // Roles are live, so the read returns quickly; cap well under the default.
+            match self.broker.command(&session_id, tool, json!({ "limit": limit }), role, 12_000).await {
+                Ok(res) if res.ok => {
+                    let result = res.result.unwrap_or(Value::Null);
+                    let buffered = result.get("buffered").cloned().unwrap_or(json!(null));
+                    if let Some(logs) = result.get("logs").and_then(Value::as_array) {
+                        for line in logs {
+                            let mut entry = line.clone();
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("role".into(), json!(key));
+                            }
+                            merged.push(entry);
+                        }
+                    }
+                    report.insert(key.into(), json!({ "live": true, "buffered": buffered }));
+                }
+                Ok(res) => {
+                    report.insert(key.into(), json!({ "live": true, "error": res.error }));
+                }
+                Err(e) => {
+                    report.insert(key.into(), json!({ "live": true, "error": e.to_string() }));
+                }
+            }
+        }
+
+        if !any_live {
+            report.insert(
+                "note".into(),
+                json!("no live server/client helper — is a playtest running? Use start_playtest."),
+            );
+        }
+
+        // Time-order ascending (ts is epoch seconds from both roles), stable so
+        // same-second lines keep server-before-client order, then keep the newest `limit`.
+        merged.sort_by_key(|e| e.get("ts").and_then(Value::as_i64).unwrap_or(0));
+        if merged.len() > limit as usize {
+            merged.drain(0..merged.len() - limit as usize);
+        }
+        report.insert("logs".into(), Value::Array(merged));
 
         ok_json(&Value::Object(report))
     }
